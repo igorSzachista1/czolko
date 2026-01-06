@@ -753,7 +753,7 @@ socket.on('game-end', ({ winner }) => {
   currentGameData = null;
   const grid = document.getElementById('camera-grid');
   if (grid) grid.innerHTML = '';
-  cleanupConnections(true); // stop local stream
+  cleanupConnections(false); // close connections but keep local stream active for next game
 });
 
 // Expose functions to global scope for HTML onclick
