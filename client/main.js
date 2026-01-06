@@ -89,49 +89,295 @@ function giveHint() {
 
 
 
-// Przechowuj połączenia: peerId -> { pc, stream }
-const connections = new Map();
-
-const rtcConfig = {
-  iceServers: [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun2.l.google.com:19302" },
-    { urls: "stun:stun3.l.google.com:19302" },
-    { urls: "stun:stun4.l.google.com:19302" },
-    {
-      urls: "turn:turn.anyfirewall.com:443?transport=tcp",
-      username: "webrtc",
-      credential: "webrtc"
-    },
-    {
-      urls: "turn:relay.backups.cz",
-      username: "webrtc",
-      credential: "webrtc"
-    }
-  ]
-};
-
 // ======================
-// INICJALIZACJA KAMERY
+// NOWA FUNKCJONALNOŚĆ KAMEREK I WEBRTC
 // ======================
-async function initCamera() {
+
+// Stan kamery i połączeń
+let localStream = null;
+let peerConnections = new Map(); // peerId -> RTCPeerConnection
+let remoteStreams = new Map(); // peerId -> MediaStream
+
+// Inicjalizacja kamery - wywołaj raz na początku
+async function initializeCamera() {
+  if (localStream) return true; // już zainicjalizowana
+
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ 
-      video: true, 
-      audio: true 
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 320, height: 240 },
+      audio: true
     });
-    console.log("✅ Kamera OK");
+    console.log("✅ Kamera zainicjalizowana");
     return true;
-  } catch (err) {
-    console.error("❌ Błąd kamery:", err);
+  } catch (error) {
+    console.error("❌ Błąd kamery:", error);
     alert("Brak dostępu do kamery/mikrofonu!");
     return false;
   }
 }
 
-// Inicjalizuj kamerę od razu
-initCamera();
+// Zatrzymaj kamerę całkowicie
+function stopCamera() {
+  if (localStream) {
+    localStream.getTracks().forEach(track => track.stop());
+    localStream = null;
+    console.log("📷 Kamera zatrzymana");
+  }
+}
+
+// Utwórz połączenie WebRTC z innym graczem
+async function createPeerConnection(peerId, isInitiator) {
+  if (peerConnections.has(peerId)) {
+    console.log(`⚠️ Połączenie z ${peerId} już istnieje`);
+    return;
+  }
+
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "turn:turn.anyfirewall.com:443?transport=tcp", username: "webrtc", credential: "webrtc" }
+    ]
+  });
+
+  peerConnections.set(peerId, pc);
+
+  // Dodaj lokalne media do połączenia
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      pc.addTrack(track, localStream);
+    });
+  }
+
+  // Obsługa przychodzących strumieni
+  pc.ontrack = (event) => {
+    console.log(`📥 Strumień od ${peerId}`);
+    remoteStreams.set(peerId, event.streams[0]);
+    assignStreamToVideo(peerId, event.streams[0]);
+  };
+
+  // Obsługa ICE kandydatów
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit("webrtc-signal", {
+        to: peerId,
+        signal: { type: "ice-candidate", candidate: event.candidate }
+      });
+    }
+  };
+
+  // Obsługa zmian stanu połączenia
+  pc.onconnectionstatechange = () => {
+    console.log(`🔗 Stan połączenia z ${peerId}: ${pc.connectionState}`);
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      closePeerConnection(peerId);
+    }
+  };
+
+  // Jeśli jesteśmy inicjatorem, wyślij ofertę
+  if (isInitiator) {
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit("webrtc-signal", {
+        to: peerId,
+        signal: { type: "offer", sdp: offer }
+      });
+      console.log(`📤 Wysłano ofertę do ${peerId}`);
+    } catch (error) {
+      console.error(`❌ Błąd tworzenia oferty dla ${peerId}:`, error);
+    }
+  }
+}
+
+// Zamknij połączenie z graczem
+function closePeerConnection(peerId) {
+  const pc = peerConnections.get(peerId);
+  if (pc) {
+    pc.close();
+    peerConnections.delete(peerId);
+    remoteStreams.delete(peerId);
+    console.log(`🔌 Zamknięto połączenie z ${peerId}`);
+  }
+}
+
+// Zamknij wszystkie połączenia
+function closeAllPeerConnections() {
+  for (const peerId of peerConnections.keys()) {
+    closePeerConnection(peerId);
+  }
+}
+
+// Obsługa sygnałów WebRTC
+socket.on("webrtc-signal", async ({ from, signal }) => {
+  console.log(`📨 Sygnał od ${from}: ${signal.type}`);
+
+  let pc = peerConnections.get(from);
+
+  if (signal.type === "offer") {
+    if (!pc) {
+      await createPeerConnection(from, false);
+      pc = peerConnections.get(from);
+    }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("webrtc-signal", {
+        to: from,
+        signal: { type: "answer", sdp: answer }
+      });
+      console.log(`📤 Wysłano odpowiedź do ${from}`);
+    } catch (error) {
+      console.error(`❌ Błąd obsługi oferty od ${from}:`, error);
+    }
+  } else if (signal.type === "answer") {
+    if (pc) {
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        console.log(`✅ Ustawiono odpowiedź od ${from}`);
+      } catch (error) {
+        console.error(`❌ Błąd ustawiania odpowiedzi od ${from}:`, error);
+      }
+    }
+  } else if (signal.type === "ice-candidate") {
+    if (pc) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+      } catch (error) {
+        console.error(`❌ Błąd dodawania ICE od ${from}:`, error);
+      }
+    }
+  }
+});
+
+// Renderuj graczy w gridzie kamer
+async function renderPlayers(players) {
+  const grid = document.getElementById("camera-grid");
+  grid.innerHTML = "";
+
+  for (const player of players) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "video scale-in";
+    wrapper.id = `player-${player.id}`;
+
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.playsInline = true;
+    video.id = `video-${player.id}`;
+    video.muted = player.id === myId; // wycisz swoją kamerę
+
+    const nick = document.createElement("div");
+    nick.className = "player-nick";
+    nick.innerText = player.nick;
+
+    wrapper.appendChild(video);
+
+    if (player.id !== myId && player.assignedWord) {
+      const word = document.createElement("div");
+      word.className = "word";
+      word.innerText = player.assignedWord;
+      wrapper.appendChild(word);
+    }
+
+    wrapper.appendChild(nick);
+    grid.appendChild(wrapper);
+
+    // Utwórz połączenie jeśli potrzebne
+    if (player.id !== myId && !peerConnections.has(player.id)) {
+      const isInitiator = players.find(p => p.id === myId)?.isHost || false;
+      await createPeerConnection(player.id, isInitiator);
+    }
+
+    // Przypisz strumień do video
+    if (player.id === myId) {
+      assignStreamToVideo(player.id, localStream);
+    } else {
+      const stream = remoteStreams.get(player.id);
+      if (stream) {
+        assignStreamToVideo(player.id, stream);
+      }
+    }
+  }
+}
+
+// Przypisz strumień do elementu video
+function assignStreamToVideo(peerId, stream) {
+  const videoEl = document.getElementById(`video-${peerId}`);
+  if (videoEl && stream) {
+    videoEl.srcObject = stream;
+    console.log(`📹 Strumień przypisany do ${peerId}`);
+  }
+}
+
+// ======================
+// RENDER GRACZY
+// ======================
+socket.on("round-start", async data => {
+  console.log("🎮 Runda rozpoczęta");
+
+  // Ukryj lobby, pokaż sekcję gry
+  const lobby = document.getElementById('lobby');
+  const gameSection = document.getElementById('game-section');
+  if (lobby) lobby.classList.add('hidden');
+  if (gameSection) gameSection.classList.remove('hidden');
+
+  // Pokaż grid kamer
+  const cameraGrid = document.getElementById('camera-grid');
+  if (cameraGrid) cameraGrid.classList.remove('hidden');
+
+  currentGameData = data; // store for guessing
+
+  await renderPlayers(data.players);
+
+  // Show hint for my word (first letter)
+  const myPlayer = data.players.find(p => p.id === myId);
+  if (myPlayer) {
+    document.getElementById('myWordHint').innerText = myPlayer.assignedWord.charAt(0).toUpperCase() + '...';
+    // If already guessed, disable input
+    if (myPlayer.guessed) {
+      const guessInput = document.getElementById('guessInput');
+      const guessBtn = document.getElementById('guessBtn');
+      if (guessInput) guessInput.disabled = true;
+      if (guessBtn) guessBtn.disabled = true;
+    }
+  }
+
+  // Host controls
+  const me = data.players.find(p => p.id === myId);
+  const hostControls = document.getElementById('host-controls');
+  if (me?.isHost && hostControls) {
+    hostControls.innerHTML = `<button onclick="giveHint()">💡 Daj podpowiedź</button>`;
+  } else if (hostControls) {
+    hostControls.innerHTML = '';
+  }
+});
+
+// Obsługa istniejących graczy (po dołączeniu)
+socket.on("existing-players", async (playerIds) => {
+  console.log("📋 Istniejący gracze:", playerIds);
+  for (const peerId of playerIds) {
+    await createPeerConnection(peerId, true);
+  }
+});
+
+// Obsługa nowego gracza
+socket.on("user-joined", async (userId) => {
+  console.log("🔔 Nowy gracz:", userId);
+  // Czekamy na jego ofertę
+});
+
+// Obsługa wyjścia gracza
+socket.on("user-left", (userId) => {
+  console.log("👋 Gracz wyszedł:", userId);
+  closePeerConnection(userId);
+  // Usuń z UI jeśli potrzebne
+  const wrapper = document.getElementById(`player-${userId}`);
+  if (wrapper) wrapper.remove();
+});
+
+// Inicjalizuj kamerę na początku
+initializeCamera();
 
 // ======================
 // LOBBY
@@ -214,62 +460,6 @@ socket.on('joined', ({ roomId, playerToken }) => {
   }
 });
 
-// Update lobby players list and admin controls
-socket.on("players-update", players => {
-  myId = socket.id;
-  lobbyPlayers = players;
-  updateLobby();
-  const me = players.find(p => p.id === myId);
-  console.log("Me:", me);
-  document.getElementById("admin").innerHTML = me?.isHost
-    ? `<button onclick="startGame()">▶️ Start gry</button>`
-    : "";
-
-  // Update word input based on my ready status
-  const wordInput = document.getElementById('wordInput');
-  const wordBtn = document.getElementById('wordInput')?.nextElementSibling;
-  if (me?.ready) {
-    if (wordInput) wordInput.disabled = true;
-    if (wordBtn && wordBtn.tagName === 'BUTTON') wordBtn.disabled = true;
-  } else {
-    if (wordInput) {
-      wordInput.disabled = false;
-      wordInput.value = ''; // clear
-    }
-    if (wordBtn && wordBtn.tagName === 'BUTTON') wordBtn.disabled = false;
-  }
-});
-
-// Attempt reconnect if we have saved token
-async function attemptReconnect() {
-  const savedRoom = localStorage.getItem('cz_roomId');
-  const savedToken = localStorage.getItem('cz_playerToken');
-  const savedNick = localStorage.getItem('cz_nick');
-  if (savedRoom && savedToken) {
-    currentRoomId = savedRoom;
-    // show lobby while reconnecting
-    const lobby = document.getElementById('lobby');
-    const joinSection = document.getElementById('join-section');
-    if (lobby && joinSection) {
-      joinSection.classList.add('hidden');
-      lobby.classList.remove('hidden');
-      document.getElementById('roomCode').innerText = savedRoom;
-    }
-
-    // ensure camera is initialized before reconnecting
-    if (!localStream) {
-      await initCamera();
-    }
-
-    socket.emit('reconnect-room', { roomId: savedRoom, playerToken: savedToken, nick: savedNick });
-  }
-}
-
-socket.on('connect', () => {
-  myId = socket.id;
-  attemptReconnect();
-});
-
 // handle server errors (e.g. invalid token on reconnect)
 socket.on('error', msg => {
   try {
@@ -295,6 +485,32 @@ socket.on('hint-update', hints => {
       document.getElementById('myWordHint').innerText = h.hint;
     }
   });
+});
+
+// Update lobby players list and admin controls
+socket.on("players-update", players => {
+  myId = socket.id;
+  lobbyPlayers = players;
+  updateLobby();
+  const me = players.find(p => p.id === myId);
+  console.log("Me:", me);
+  document.getElementById("admin").innerHTML = me?.isHost
+    ? `<button onclick="startGame()">▶️ Start gry</button>`
+    : "";
+
+  // Update word input based on my ready status
+  const wordInput = document.getElementById('wordInput');
+  const wordBtn = document.getElementById('wordInput')?.nextElementSibling;
+  if (me?.ready) {
+    if (wordInput) wordInput.disabled = true;
+    if (wordBtn && wordBtn.tagName === 'BUTTON') wordBtn.disabled = true;
+  } else {
+    if (wordInput) {
+      wordInput.disabled = false;
+      wordInput.value = ''; // clear
+    }
+    if (wordBtn && wordBtn.tagName === 'BUTTON') wordBtn.disabled = false;
+  }
 });
 
 // Submit word from lobby
@@ -345,21 +561,6 @@ function submitGuess() {
   }
 }
 
-// Close and clean up peer connections
-function cleanupConnections(stopLocal = false) {
-  for (const [peerId, conn] of connections.entries()) {
-    try {
-      conn.pc.close();
-    } catch (e) {}
-  }
-  connections.clear();
-
-  if (stopLocal && localStream) {
-    localStream.getTracks().forEach(t => t.stop());
-    localStream = null;
-  }
-}
-
 // Leave lobby UI + notify server
 function leaveLobby() {
   if (currentRoomId) socket.emit('leave-room', { roomId: currentRoomId });
@@ -380,7 +581,7 @@ function leaveLobby() {
   updateLobby();
 
   // Close connections but keep camera active
-  cleanupConnections(false);
+  closeAllPeerConnections();
   // remove saved session
   localStorage.removeItem('cz_roomId');
   localStorage.removeItem('cz_playerToken');
@@ -401,7 +602,8 @@ function leaveGame() {
   if (grid) grid.innerHTML = '';
 
   // stop camera and close connections
-  cleanupConnections(true);
+  closeAllPeerConnections();
+  stopCamera();
 
   currentRoomId = null;
   lobbyPlayers = [];
@@ -417,307 +619,32 @@ function startGame() {
   socket.emit("start-game", currentRoomId);
 }
 
-// ======================
-// RENDER GRACZY
-// ======================
-socket.on("round-start", async data => {
-  console.log("🎮 Runda rozpoczęta");
-
-  // Ensure camera is initialized
-  if (!localStream) {
-    await initCamera();
-  }
-
-  // Ukryj lobby, pokaż sekcję gry
-  const lobby = document.getElementById('lobby');
-  const gameSection = document.getElementById('game-section');
-  if (lobby) lobby.classList.add('hidden');
-  if (gameSection) gameSection.classList.remove('hidden');
-
-  // Pokaż grid kamer
-  const cameraGrid = document.getElementById('camera-grid');
-  if (cameraGrid) cameraGrid.classList.remove('hidden');
-
-  currentGameData = data; // store for guessing
-
-  await renderPlayers(data.players);
-
-  // Show hint for my word (first letter)
-  const myPlayer = data.players.find(p => p.id === myId);
-  if (myPlayer) {
-    document.getElementById('myWordHint').innerText = myPlayer.assignedWord.charAt(0).toUpperCase() + '...';
-    // If already guessed, disable input
-    if (myPlayer.guessed) {
-      const guessInput = document.getElementById('guessInput');
-      const guessBtn = document.getElementById('guessBtn');
-      if (guessInput) guessInput.disabled = true;
-      if (guessBtn) guessBtn.disabled = true;
-    }
-  }
-
-  // Host controls
-  const me = data.players.find(p => p.id === myId);
-  const hostControls = document.getElementById('host-controls');
-  if (me?.isHost && hostControls) {
-    hostControls.innerHTML = `<button onclick="giveHint()">💡 Daj podpowiedź</button>`;
-  } else if (hostControls) {
-    hostControls.innerHTML = '';
-  }
-});
-
-
-async function renderPlayers(players) {
-  const grid = document.getElementById("camera-grid");
-  grid.innerHTML = "";
-
-  for (let i = 0; i < players.length; i++) {
-    const player = players[i];
-    const index = i;
-    const wrapper = document.createElement("div");
-    wrapper.className = "video scale-in";
-    wrapper.id = `player-${player.id}`;
-    wrapper.style.animationDelay = (index * 0.1) + 's'; // stagger
-
-    const video = document.createElement("video");
-    video.autoplay = true;
-    video.playsInline = true;
-    video.id = `video-${player.id}`;
-
-    const nick = document.createElement("div");
-    nick.className = "player-nick";
-    nick.innerText = player.nick;
-
-    wrapper.appendChild(video);
-
-    // Show assigned word for OTHER players only; hide your own assigned word
-    if (player.id !== myId && player.assignedWord) {
-      const word = document.createElement("div");
-      word.className = "word";
-      word.innerText = player.assignedWord;
-      wrapper.appendChild(word);
+// Attempt reconnect if we have saved token
+async function attemptReconnect() {
+  const savedRoom = localStorage.getItem('cz_roomId');
+  const savedToken = localStorage.getItem('cz_playerToken');
+  const savedNick = localStorage.getItem('cz_nick');
+  if (savedRoom && savedToken) {
+    currentRoomId = savedRoom;
+    // show lobby while reconnecting
+    const lobby = document.getElementById('lobby');
+    const joinSection = document.getElementById('join-section');
+    if (lobby && joinSection) {
+      joinSection.classList.add('hidden');
+      lobby.classList.remove('hidden');
+      document.getElementById('roomCode').innerText = savedRoom;
     }
 
-    wrapper.appendChild(nick);
-    grid.appendChild(wrapper);
+    // ensure camera is initialized before reconnecting
+    await initializeCamera();
 
-    // Create connection if not exists
-    if (player.id !== myId && !connections.has(player.id)) {
-      const me = players.find(p => p.id === myId);
-      const caller = me.isHost;
-      await createConnection(player.id, caller);
-    }
-
-    // Przypisz strumienie
-    if (player.id === myId) {
-      video.srcObject = localStream;
-      video.muted = true;
-      console.log("📹 Moja kamera przypisana");
-    } else {
-      const conn = connections.get(player.id);
-      if (conn && conn.stream) {
-        video.srcObject = conn.stream;
-        console.log("📹 Strumień od", player.nick, "przypisany");
-      } else {
-        console.log("⏳ Czekam na strumień od", player.nick);
-      }
-    }
+    socket.emit('reconnect-room', { roomId: savedRoom, playerToken: savedToken, nick: savedNick });
   }
 }
 
-// ======================
-// WEBRTC - NOWE POŁĄCZENIE
-// ======================
-
-// Gdy dołączamy do pokoju - dostajemy listę istniejących graczy
-socket.on("existing-players", async playerIds => {
-  console.log("📋 Istniejący gracze:", playerIds);
-  
-  if (!localStream) {
-    await initCamera();
-  }
-  
-  // Połącz się z każdym jako CALLER
-  for (const playerId of playerIds) {
-    await createConnection(playerId, true);
-  }
-});
-
-// Gdy ktoś nowy dołącza - czekamy na jego offer
-socket.on("user-joined", async userId => {
-  console.log("🔔 Nowy gracz:", userId);
-  // Nie robimy nic - czekamy aż on wyśle offer
-});
-
-// Gdy ktoś wychodzi
-socket.on("user-left", userId => {
-  console.log("👋 Gracz wyszedł:", userId);
-  const conn = connections.get(userId);
-  if (conn) {
-    conn.pc.close();
-    connections.delete(userId);
-  }
-});
-
-// ======================
-// TWORZENIE POŁĄCZENIA
-// ======================
-async function createConnection(peerId, isCaller) {
-  console.log(`🔗 Tworzę połączenie z ${peerId} (caller: ${isCaller})`);
-
-  if (!localStream) {
-    console.log("⏳ Czekam na kamerę...");
-    setTimeout(() => createConnection(peerId, isCaller), 500);
-    return;
-  }
-
-  if (connections.has(peerId)) {
-    console.log("⚠️ Połączenie już istnieje");
-    return;
-  }
-
-  const pc = new RTCPeerConnection(rtcConfig);
-  const connData = { pc, stream: null };
-  connections.set(peerId, connData);
-
-  // Dodaj lokalne tracki
-  localStream.getTracks().forEach(track => {
-    pc.addTrack(track, localStream);
-    console.log("➕ Dodano track:", track.kind);
-  });
-
-  // Odbierz zdalne tracki
-  pc.ontrack = event => {
-    console.log("📥 OTRZYMANO TRACK od:", peerId, event.track.kind);
-    
-    if (event.streams[0]) {
-      connData.stream = event.streams[0];
-      
-      // Przypisz do video jeśli już istnieje
-      const videoEl = document.getElementById(`video-${peerId}`);
-      if (videoEl) {
-        videoEl.srcObject = event.streams[0];
-        console.log("✅ Strumień przypisany do video!");
-      }
-    }
-  };
-
-  // ICE candidates
-  pc.onicecandidate = event => {
-    if (event.candidate) {
-      console.log("🧊 Wysyłam ICE candidate");
-      socket.emit("webrtc-signal", {
-        to: peerId,
-        signal: {
-          type: "ice-candidate",
-          candidate: event.candidate
-        }
-      });
-    }
-  };
-
-  // Monitoring stanu
-  pc.onconnectionstatechange = () => {
-    console.log(`🔗 ${peerId}: ${pc.connectionState}`);
-    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      // Usuń strumień z video jeśli połączenie nieudane
-      const videoEl = document.getElementById(`video-${peerId}`);
-      if (videoEl) {
-        videoEl.srcObject = null;
-        console.log(`❌ Połączenie z ${peerId} nieudane, usunięto strumień`);
-      }
-      connData.stream = null;
-      // Zamknij połączenie
-      pc.close();
-      connections.delete(peerId);
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    console.log(`🧊 ${peerId}: ${pc.iceConnectionState}`);
-  };
-
-  // Jeśli jesteśmy CALLER - wyślij offer
-  if (isCaller) {
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      
-      console.log("📤 Wysyłam OFFER do:", peerId);
-      socket.emit("webrtc-signal", {
-        to: peerId,
-        signal: {
-          type: "offer",
-          sdp: offer
-        }
-      });
-    } catch (err) {
-      console.error("❌ Błąd tworzenia offer:", err);
-    }
-  }
-}
-
-// ======================
-// OBSŁUGA SYGNAŁÓW
-// ======================
-socket.on("webrtc-signal", async ({ from, signal }) => {
-  console.log("📨 Sygnał od:", from, "typ:", signal.type);
-
-  let conn = connections.get(from);
-
-  if (signal.type === "offer") {
-    // Odbieramy offer - tworzymy połączenie jako CALLEE
-    if (!conn) {
-      await createConnection(from, false);
-      conn = connections.get(from);
-    }
-
-    try {
-      await conn.pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-      console.log("✅ Remote description (offer) ustawiony");
-
-      const answer = await conn.pc.createAnswer();
-      await conn.pc.setLocalDescription(answer);
-
-      console.log("📤 Wysyłam ANSWER do:", from);
-      socket.emit("webrtc-signal", {
-        to: from,
-        signal: {
-          type: "answer",
-          sdp: answer
-        }
-      });
-    } catch (err) {
-      console.error("❌ Błąd obsługi offer:", err);
-    }
-  }
-
-  else if (signal.type === "answer") {
-    if (!conn) {
-      console.log("❌ Brak połączenia dla answer");
-      return;
-    }
-
-    try {
-      await conn.pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
-      console.log("✅ Remote description (answer) ustawiony");
-    } catch (err) {
-      console.error("❌ Błąd obsługi answer:", err);
-    }
-  }
-
-  else if (signal.type === "ice-candidate") {
-    if (!conn) {
-      console.log("❌ Brak połączenia dla ICE");
-      return;
-    }
-
-    try {
-      await conn.pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
-      console.log("✅ ICE candidate dodany");
-    } catch (err) {
-      console.error("❌ Błąd dodawania ICE:", err);
-    }
-  }
+socket.on('connect', () => {
+  myId = socket.id;
+  attemptReconnect();
 });
 
 // PLAYER GUESSED
@@ -753,7 +680,7 @@ socket.on('game-end', ({ winner }) => {
   currentGameData = null;
   const grid = document.getElementById('camera-grid');
   if (grid) grid.innerHTML = '';
-  cleanupConnections(false); // close connections but keep local stream active for next game
+  closeAllPeerConnections(); // close connections but keep local stream active for next game
 });
 
 // Expose functions to global scope for HTML onclick
