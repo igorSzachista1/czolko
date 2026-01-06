@@ -8,7 +8,7 @@ import { fileURLToPath } from "url";
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: { origin: "https://czolko-0stu.onrender.com" }
 });
 
 const __filename = fileURLToPath(import.meta.url);

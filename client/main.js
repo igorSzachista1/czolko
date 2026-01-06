@@ -1,4 +1,9 @@
-const socket = io();
+import { io } from "socket.io-client";
+
+const socket = io("https://czolko-0stu.onrender.com", {
+  transports: ["websocket"],
+});
+
 
 let localStream = null;
 let currentRoomId = null;
