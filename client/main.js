@@ -1,4 +1,4 @@
-import { io } from "socket.io-client";
+// Socket.IO loaded from CDN
 
 const socket = io("https://czolko-0stu.onrender.com", {
   transports: ["websocket"],
