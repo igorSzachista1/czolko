@@ -756,4 +756,14 @@ socket.on('game-end', ({ winner }) => {
   cleanupConnections(true); // stop local stream
 });
 
+// Expose functions to global scope for HTML onclick
+window.createRoom = createRoom;
+window.joinRoom = joinRoom;
+window.submitWord = submitWord;
+window.submitGuess = submitGuess;
+window.startGame = startGame;
+window.giveHint = giveHint;
+window.leaveLobby = leaveLobby;
+window.leaveGame = leaveGame;
+
 

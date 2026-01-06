@@ -1,6 +1,7 @@
 {
-  "name": "server",
+  "name": "czolko",
   "version": "1.0.0",
+  "type": "module",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -9,7 +10,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "express": "^5.2.1",
     "nanoid": "^5.1.6",
